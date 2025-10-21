@@ -1,26 +1,89 @@
-#include "database.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <stdbool.h>
 #include <unistd.h>
-#include <sys/stat.h>
-#include <fcntl.h>
+#include <sys/shm.h>
+#include <sys/sem.h>
+#include <sys/ipc.h>
 #include <signal.h>
 #include <time.h>
 #include <sys/wait.h>
 #include <errno.h>
 
-// Variables globales para comunicación
-int pipe_fd = -1;
+#define HASH_SIZE 1000
+#define MAX_TITLE 256
+#define MAX_ARTIST 256
+#define MAX_ALBUM 256
+#define MAX_RESULTS 100
+#define SHM_KEY 0x1234
+#define SEM_KEY 0x5678
+
+typedef struct Song {
+    char id[64];
+    char name[MAX_TITLE];
+    char album[MAX_ALBUM];
+    char artists[MAX_ARTIST];
+    int year;
+    int duration_ms;
+    double danceability;
+    double energy;
+    double tempo;
+    long next;
+} Song;
+
+typedef struct HashEntry {
+    long first_position;
+} HashEntry;
+
+// Estructura para memoria compartida
+typedef struct {
+    int search_type;
+    char search_term[256];
+    int search_year;
+    int result_count;
+    Song results[MAX_RESULTS];
+    int request_ready;  // 0 = esperando, 1 = solicitud lista
+    int response_ready; // 0 = procesando, 1 = respuesta lista
+    int shutdown;       // 0 = ejecutando, 1 = terminar
+} SharedData;
+
+// Variables globales
+int shm_id, sem_id;
+SharedData *shared_data;
 pid_t db_pid = -1;
+
+// Operaciones sobre semáforos
+void sem_wait(int sem_id) {
+    struct sembuf op = {0, -1, 0};
+    semop(sem_id, &op, 1);
+}
+
+void sem_signal(int sem_id) {
+    struct sembuf op = {0, 1, 0};
+    semop(sem_id, &op, 1);
+}
 
 // Función para limpiar recursos
 void cleanup() {
-    if (pipe_fd != -1) {
-        close(pipe_fd);
+    if (shared_data) {
+        shared_data->shutdown = 1;
+        shared_data->request_ready = 1; // Despertar al proceso BD
     }
-    unlink(PIPE_NAME);
     
     if (db_pid != -1) {
         kill(db_pid, SIGTERM);
         waitpid(db_pid, NULL, 0);
+    }
+    
+    // Liberar memoria compartida y semáforos
+    if (shm_id != -1) {
+        shmdt(shared_data);
+        shmctl(shm_id, IPC_RMID, NULL);
+    }
+    if (sem_id != -1) {
+        semctl(sem_id, 0, IPC_RMID);
     }
 }
 
@@ -32,87 +95,16 @@ void signal_handler(int sig) {
     exit(0);
 }
 
-// Función para crear base de datos desde CSV (del creador original)
-void create_database_from_csv() {
-    const char *csv_filename = "tracks_features.csv";
-    const char *bin_filename = "songs_database.bin";
+// Función hash
+int hash_function(const char *name) {
+    unsigned long hash = 5381;
+    int c;
     
-    printf("=== CREANDO BASE DE DATOS COMPLETA ===\n");
-    
-    // Verificar si existe el CSV
-    FILE *csv_file = fopen(csv_filename, "r");
-    if (!csv_file) {
-        printf("Error: No se encuentra el archivo '%s'\n", csv_filename);
-        printf("Coloque el archivo CSV en el mismo directorio y vuelva a ejecutar.\n");
-        return;
-    }
-    fclose(csv_file);
-    
-    // Crear archivo binario básico primero
-    printf("Creando estructura de base de datos...\n");
-    
-    FILE *bin_file = fopen(bin_filename, "wb");
-    if (!bin_file) {
-        printf("Error creando archivo binario\n");
-        return;
+    while ((c = tolower(*name++))) {
+        hash = ((hash << 5) + hash) + c;
     }
     
-    HashEntry hash_table[HASH_SIZE];
-    for (int i = 0; i < HASH_SIZE; i++) {
-        hash_table[i].first_position = -1;
-    }
-    
-    fwrite(hash_table, sizeof(HashEntry), HASH_SIZE, bin_file);
-    fclose(bin_file);
-    
-    printf("Base de datos básica creada. Cargando canciones desde CSV...\n");
-    printf("Esto puede tomar varios minutos...\n");
-    
-    // Usar la función de carga del database.c
-    load_songs_from_csv(csv_filename, bin_filename);
-    
-    printf("=== BASE DE DATOS CREADA EXITOSAMENTE ===\n");
-}
-
-// Función para esperar a que el pipe esté disponible
-int wait_for_pipe(const char *pipe_name, int max_attempts) {
-    int attempts = 0;
-    while (attempts < max_attempts) {
-        int fd = open(pipe_name, O_WRONLY | O_NONBLOCK);
-        if (fd != -1) {
-            close(fd);
-            return 0;
-        }
-        if (errno != ENOENT) {
-            return 0;
-        }
-        sleep(1);
-        attempts++;
-        printf("Esperando a que la base de datos esté lista... (%d/%d)\n", attempts, max_attempts);
-    }
-    return -1;
-}
-
-// Función para enviar solicitud y recibir respuesta
-int send_search_request(SearchRequest *req, SearchResponse *resp) {
-    if (pipe_fd == -1) {
-        printf("Error: No hay conexión con la base de datos\n");
-        return -1;
-    }
-    
-    ssize_t bytes_written = write(pipe_fd, req, sizeof(SearchRequest));
-    if (bytes_written != sizeof(SearchRequest)) {
-        printf("Error enviando solicitud\n");
-        return -1;
-    }
-    
-    ssize_t bytes_read = read(pipe_fd, resp, sizeof(SearchResponse));
-    if (bytes_read != sizeof(SearchResponse)) {
-        printf("Error recibiendo respuesta\n");
-        return -1;
-    }
-    
-    return 0;
+    return hash % HASH_SIZE;
 }
 
 // Función para formatear duración
@@ -123,29 +115,45 @@ void format_duration(int duration_ms, char *buffer, size_t buffer_size) {
     snprintf(buffer, buffer_size, "%d:%02d", minutes, seconds);
 }
 
-// Mostrar resultados
-void display_results(SearchResponse *resp) {
-    if (resp->result_count == 0) {
+// Función para mostrar resultados
+void display_results() {
+    if (shared_data->result_count == 0) {
         printf("NA - No se encontraron resultados\n");
         return;
     }
     
-    printf("\n=== RESULTADOS ENCONTRADOS: %d ===\n", resp->result_count);
+    printf("\n=== RESULTADOS ENCONTRADOS: %d ===\n", shared_data->result_count);
     
-    for (int i = 0; i < resp->result_count && i < 10; i++) {
-        Song *song = &resp->results[i];
+    for (int i = 0; i < shared_data->result_count && i < 10; i++) {
+        Song *song = &shared_data->results[i];
         char duration_str[20];
         format_duration(song->duration_ms, duration_str, sizeof(duration_str));
         
-        printf("\n%d. %s\n", i + 1, song->name);
-        printf("   Artista: %s\n", song->artists);
-        printf("   Álbum: %s | Año: %d\n", song->album, song->year);
-        printf("   Duración: %s | Bailabilidad: %.3f | Energía: %.3f\n", 
-               duration_str, song->danceability, song->energy);
+        if (shared_data->result_count == 1) {
+            printf("\n★ Canción encontrada ★\n");
+            printf("ID: %s\n", song->id);
+            printf("Nombre: %s\n", song->name);
+            printf("Artista(s): %s\n", song->artists);
+            printf("Álbum: %s\n", song->album);
+            printf("Año: %d\n", song->year);
+            printf("Duración: %s\n", duration_str);
+            printf("Bailabilidad: %.3f\n", song->danceability);
+            printf("Energía: %.3f\n", song->energy);
+            printf("Tempo: %.1f BPM\n", song->tempo);
+            printf("---\n");
+        } else {
+            printf("\n%d. %s - %s\n", i + 1, song->name, song->artists);
+            printf("   Álbum: %s | Año: %d | Duración: %s\n", 
+                   song->album, song->year, duration_str);
+            if (i == 0) {
+                printf("   Bailabilidad: %.3f | Energía: %.3f | Tempo: %.1f BPM\n",
+                       song->danceability, song->energy, song->tempo);
+            }
+        }
     }
     
-    if (resp->result_count > 10) {
-        printf("\n... y %d resultados más\n", resp->result_count - 10);
+    if (shared_data->result_count > 10) {
+        printf("\n... y %d resultados más\n", shared_data->result_count - 10);
     }
 }
 
@@ -165,17 +173,227 @@ int safe_scanf_int(const char *format, int *value) {
     return result;
 }
 
-int safe_scanf_double(const char *format, double *value) {
-    int result = scanf(format, value);
-    while (getchar() != '\n');
-    return result;
+// Función para buscar por nombre exacto
+int search_by_exact_name(const char *filename, const char *name, Song *results, int max_results) {
+    FILE *file = fopen(filename, "rb");
+    if (!file) return 0;
+    
+    HashEntry hash_table[HASH_SIZE];
+    if (fread(hash_table, sizeof(HashEntry), HASH_SIZE, file) != HASH_SIZE) {
+        fclose(file);
+        return 0;
+    }
+    
+    int hash_index = hash_function(name);
+    long current_pos = hash_table[hash_index].first_position;
+    int found = 0;
+    
+    while (current_pos != -1 && found < max_results) {
+        fseek(file, current_pos, SEEK_SET);
+        Song song;
+        if (fread(&song, sizeof(Song), 1, file) != 1) break;
+        
+        if (strcasecmp(song.name, name) == 0) {
+            results[found++] = song;
+        }
+        
+        current_pos = song.next;
+    }
+    
+    fclose(file);
+    return found;
 }
 
-// Función segura para leer caracter
-int safe_scanf_char(char *value) {
-    int result = scanf(" %c", value);
-    while (getchar() != '\n');
-    return result;
+// Función para buscar por palabra en el nombre
+int search_by_name_word(const char *filename, const char *word, Song *results, int max_results) {
+    FILE *file = fopen(filename, "rb");
+    if (!file) return 0;
+    
+    HashEntry hash_table[HASH_SIZE];
+    if (fread(hash_table, sizeof(HashEntry), HASH_SIZE, file) != HASH_SIZE) {
+        fclose(file);
+        return 0;
+    }
+    
+    int found = 0;
+    char lower_word[MAX_TITLE];
+    strncpy(lower_word, word, sizeof(lower_word) - 1);
+    lower_word[sizeof(lower_word) - 1] = '\0';
+    for (int i = 0; lower_word[i]; i++) {
+        lower_word[i] = tolower(lower_word[i]);
+    }
+    
+    for (int i = 0; i < HASH_SIZE && found < max_results; i++) {
+        long current_pos = hash_table[i].first_position;
+        
+        while (current_pos != -1 && found < max_results) {
+            fseek(file, current_pos, SEEK_SET);
+            Song song;
+            if (fread(&song, sizeof(Song), 1, file) != 1) break;
+            
+            char lower_name[MAX_TITLE];
+            strncpy(lower_name, song.name, sizeof(lower_name) - 1);
+            lower_name[sizeof(lower_name) - 1] = '\0';
+            for (int j = 0; lower_name[j]; j++) {
+                lower_name[j] = tolower(lower_name[j]);
+            }
+            
+            if (strstr(lower_name, lower_word) != NULL) {
+                results[found++] = song;
+            }
+            
+            current_pos = song.next;
+        }
+    }
+    
+    fclose(file);
+    return found;
+}
+
+// Función para buscar por artista
+int search_by_artist(const char *filename, const char *artist, Song *results, int max_results) {
+    FILE *file = fopen(filename, "rb");
+    if (!file) return 0;
+    
+    HashEntry hash_table[HASH_SIZE];
+    if (fread(hash_table, sizeof(HashEntry), HASH_SIZE, file) != HASH_SIZE) {
+        fclose(file);
+        return 0;
+    }
+    
+    int found = 0;
+    char lower_artist[MAX_ARTIST];
+    strncpy(lower_artist, artist, sizeof(lower_artist) - 1);
+    lower_artist[sizeof(lower_artist) - 1] = '\0';
+    for (int i = 0; lower_artist[i]; i++) {
+        lower_artist[i] = tolower(lower_artist[i]);
+    }
+    
+    for (int i = 0; i < HASH_SIZE && found < max_results; i++) {
+        long current_pos = hash_table[i].first_position;
+        
+        while (current_pos != -1 && found < max_results) {
+            fseek(file, current_pos, SEEK_SET);
+            Song song;
+            if (fread(&song, sizeof(Song), 1, file) != 1) break;
+            
+            char lower_song_artists[MAX_ARTIST];
+            strncpy(lower_song_artists, song.artists, sizeof(lower_song_artists) - 1);
+            lower_song_artists[sizeof(lower_song_artists) - 1] = '\0';
+            for (int j = 0; lower_song_artists[j]; j++) {
+                lower_song_artists[j] = tolower(lower_song_artists[j]);
+            }
+            
+            if (strstr(lower_song_artists, lower_artist) != NULL) {
+                results[found++] = song;
+            }
+            
+            current_pos = song.next;
+        }
+    }
+    
+    fclose(file);
+    return found;
+}
+
+// Función para buscar por año
+int search_by_year(const char *filename, int year, Song *results, int max_results) {
+    FILE *file = fopen(filename, "rb");
+    if (!file) return 0;
+    
+    HashEntry hash_table[HASH_SIZE];
+    if (fread(hash_table, sizeof(HashEntry), HASH_SIZE, file) != HASH_SIZE) {
+        fclose(file);
+        return 0;
+    }
+    
+    int found = 0;
+    
+    for (int i = 0; i < HASH_SIZE && found < max_results; i++) {
+        long current_pos = hash_table[i].first_position;
+        
+        while (current_pos != -1 && found < max_results) {
+            fseek(file, current_pos, SEEK_SET);
+            Song song;
+            if (fread(&song, sizeof(Song), 1, file) != 1) break;
+            
+            if (song.year == year) {
+                results[found++] = song;
+            }
+            
+            current_pos = song.next;
+        }
+    }
+    
+    fclose(file);
+    return found;
+}
+
+// Función para mostrar estadísticas
+int get_database_stats(const char *filename, int *total_songs, int *min_year, int *max_year) {
+    FILE *file = fopen(filename, "rb");
+    if (!file) return -1;
+    
+    HashEntry hash_table[HASH_SIZE];
+    if (fread(hash_table, sizeof(HashEntry), HASH_SIZE, file) != HASH_SIZE) {
+        fclose(file);
+        return -1;
+    }
+    
+    *total_songs = 0;
+    *min_year = 3000;
+    *max_year = 0;
+    
+    for (int i = 0; i < HASH_SIZE; i++) {
+        long current_pos = hash_table[i].first_position;
+        
+        while (current_pos != -1) {
+            (*total_songs)++;
+            fseek(file, current_pos, SEEK_SET);
+            Song song;
+            if (fread(&song, sizeof(Song), 1, file) != 1) break;
+            
+            if (song.year < *min_year) *min_year = song.year;
+            if (song.year > *max_year) *max_year = song.year;
+            
+            current_pos = song.next;
+        }
+    }
+    
+    fclose(file);
+    return 0;
+}
+
+// Función para enviar solicitud y esperar respuesta
+int send_search_request(int search_type, const char *search_term, int search_year) {
+    // Preparar solicitud
+    sem_wait(sem_id);
+    
+    shared_data->search_type = search_type;
+    shared_data->search_year = search_year;
+    if (search_term) {
+        strncpy(shared_data->search_term, search_term, sizeof(shared_data->search_term) - 1);
+        shared_data->search_term[sizeof(shared_data->search_term) - 1] = '\0';
+    } else {
+        shared_data->search_term[0] = '\0';
+    }
+    shared_data->response_ready = 0; // Respuesta no lista
+    shared_data->request_ready = 1;  // Solicitud lista
+    
+    sem_signal(sem_id);
+    
+    // Esperar respuesta (polling eficiente)
+    clock_t start = clock();
+    
+    while (shared_data->response_ready == 0) {
+        if ((clock() - start) / CLOCKS_PER_SEC > 10) { // Timeout de 10 segundos
+            printf("Error: Timeout en la búsqueda\n");
+            return -1;
+        }
+        usleep(1000); // Solo 1ms de espera entre verificaciones
+    }
+    
+    return 0;
 }
 
 // Proceso de interfaz de usuario
@@ -184,8 +402,8 @@ void user_interface_process() {
     printf("Base de datos de música - Proceso de Interfaz\n\n");
     
     int option;
-    SearchRequest req;
-    SearchResponse resp;
+    char search_term[256];
+    int search_year;
     
     do {
         printf("\n=== MENÚ PRINCIPAL ===\n");
@@ -193,10 +411,8 @@ void user_interface_process() {
         printf("2. Buscar por palabra en el nombre\n");
         printf("3. Buscar por artista\n");
         printf("4. Buscar por año\n");
-        printf("5. Buscar por rango de bailabilidad (0.0 - 1.0)\n");
-        printf("6. Buscar por rango de energía (0.0 - 1.0)\n");
-        printf("7. Crear/Regenerar base de datos desde CSV\n");
-        printf("8. Salir\n");
+        printf("5. Mostrar estadísticas\n");
+        printf("6. Salir\n");
         printf("Seleccione una opción: ");
         
         if (safe_scanf_int("%d", &option) != 1) {
@@ -204,63 +420,60 @@ void user_interface_process() {
             continue;
         }
         
-        memset(&req, 0, sizeof(SearchRequest));
         clock_t start, end;
         double cpu_time_used;
         
         switch (option) {
             case 1:
                 printf("Ingrese el nombre exacto de la canción: ");
-                safe_fgets(req.search_term, sizeof(req.search_term));
-                req.search_type = 1;
-                
-                start = clock();
-                if (send_search_request(&req, &resp) == 0) {
-                    end = clock();
-                    cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-                    display_results(&resp);
-                    printf("\nTiempo de búsqueda: %.3f segundos\n", cpu_time_used);
+                safe_fgets(search_term, sizeof(search_term));
+                if (strlen(search_term) > 0) {
+                    start = clock();
+                    if (send_search_request(1, search_term, 0) == 0) {
+                        end = clock();
+                        cpu_time_used = ((double)(end - start)) / CLOCKS_PER_SEC;
+                        display_results();
+                        printf("\nTiempo de búsqueda: %.3f segundos\n", cpu_time_used);
+                    }
                 }
                 break;
                 
             case 2:
                 printf("Ingrese palabra a buscar en nombres: ");
-                safe_fgets(req.search_term, sizeof(req.search_term));
-                req.search_type = 2;
-                
-                start = clock();
-                if (send_search_request(&req, &resp) == 0) {
-                    end = clock();
-                    cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-                    display_results(&resp);
-                    printf("\nTiempo de búsqueda: %.3f segundos\n", cpu_time_used);
+                safe_fgets(search_term, sizeof(search_term));
+                if (strlen(search_term) > 0) {
+                    start = clock();
+                    if (send_search_request(2, search_term, 0) == 0) {
+                        end = clock();
+                        cpu_time_used = ((double)(end - start)) / CLOCKS_PER_SEC;
+                        display_results();
+                        printf("\nTiempo de búsqueda: %.3f segundos\n", cpu_time_used);
+                    }
                 }
                 break;
                 
             case 3:
                 printf("Ingrese nombre del artista: ");
-                safe_fgets(req.search_term, sizeof(req.search_term));
-                req.search_type = 3;
-                
-                start = clock();
-                if (send_search_request(&req, &resp) == 0) {
-                    end = clock();
-                    cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-                    display_results(&resp);
-                    printf("\nTiempo de búsqueda: %.3f segundos\n", cpu_time_used);
+                safe_fgets(search_term, sizeof(search_term));
+                if (strlen(search_term) > 0) {
+                    start = clock();
+                    if (send_search_request(3, search_term, 0) == 0) {
+                        end = clock();
+                        cpu_time_used = ((double)(end - start)) / CLOCKS_PER_SEC;
+                        display_results();
+                        printf("\nTiempo de búsqueda: %.3f segundos\n", cpu_time_used);
+                    }
                 }
                 break;
                 
             case 4:
                 printf("Ingrese año a buscar: ");
-                if (safe_scanf_int("%d", &req.search_year) == 1) {
-                    req.search_type = 4;
-                    
+                if (safe_scanf_int("%d", &search_year) == 1) {
                     start = clock();
-                    if (send_search_request(&req, &resp) == 0) {
+                    if (send_search_request(4, NULL, search_year) == 0) {
                         end = clock();
-                        cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-                        display_results(&resp);
+                        cpu_time_used = ((double)(end - start)) / CLOCKS_PER_SEC;
+                        display_results();
                         printf("\nTiempo de búsqueda: %.3f segundos\n", cpu_time_used);
                     }
                 } else {
@@ -269,66 +482,28 @@ void user_interface_process() {
                 break;
                 
             case 5:
-                printf("Ingrese valor mínimo de bailabilidad (0.0-1.0): ");
-                if (safe_scanf_double("%lf", &req.min_value) == 1) {
-                    printf("Ingrese valor máximo de bailabilidad (0.0-1.0): ");
-                    if (safe_scanf_double("%lf", &req.max_value) == 1) {
-                        req.search_type = 5;
-                        
-                        start = clock();
-                        if (send_search_request(&req, &resp) == 0) {
-                            end = clock();
-                            cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-                            display_results(&resp);
-                            printf("\nTiempo de búsqueda: %.3f segundos\n", cpu_time_used);
-                        }
-                    } else {
-                        printf("Valor máximo inválido\n");
-                    }
-                } else {
-                    printf("Valor mínimo inválido\n");
+                start = clock();
+                if (send_search_request(5, NULL, 0) == 0) {
+                    end = clock();
+                    cpu_time_used = ((double)(end - start)) / CLOCKS_PER_SEC;
+                    printf("\n=== ESTADÍSTICAS DE LA BASE DE DATOS ===\n");
+                    printf("Total de canciones: %d\n", shared_data->result_count);
+                    printf("Rango de años: %d - %d\n", 
+                           shared_data->results[0].year, shared_data->results[0].duration_ms);
+                    printf("Tamaño de la tabla hash: %d\n", HASH_SIZE);
+                    printf("Tiempo de búsqueda: %.3f segundos\n", cpu_time_used);
                 }
                 break;
                 
             case 6:
-                printf("Ingrese valor mínimo de energía (0.0-1.0): ");
-                if (safe_scanf_double("%lf", &req.min_value) == 1) {
-                    printf("Ingrese valor máximo de energía (0.0-1.0): ");
-                    if (safe_scanf_double("%lf", &req.max_value) == 1) {
-                        req.search_type = 6;
-                        
-                        start = clock();
-                        if (send_search_request(&req, &resp) == 0) {
-                            end = clock();
-                            cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-                            display_results(&resp);
-                            printf("\nTiempo de búsqueda: %.3f segundos\n", cpu_time_used);
-                        }
-                    } else {
-                        printf("Valor máximo inválido\n");
-                    }
-                } else {
-                    printf("Valor mínimo inválido\n");
-                }
-                break;
-                
-            case 7:
-                printf("\n¿Está seguro de que desea crear/regenerar la base de datos? (s/n): ");
-                char confirm;
-                if (safe_scanf_char(&confirm) == 1 && (confirm == 's' || confirm == 'S')) {
-                    create_database_from_csv();
-                }
-                break;
-                
-            case 8:
-                printf("Saliendo del sistema...\n");
+                printf("Saliendo...\n");
                 break;
                 
             default:
                 printf("Opción no válida\n");
         }
         
-    } while (option != 8);
+    } while (option != 6);
 }
 
 // Proceso de base de datos
@@ -340,132 +515,138 @@ void database_process() {
     // Verificar si existe la base de datos
     FILE *test_file = fopen(bin_filename, "rb");
     if (!test_file) {
-        printf("Base de datos no encontrada: %s\n", bin_filename);
-        printf("Ejecute la opción 7 del menú para crear la base de datos desde CSV.\n");
-        
-        // Crear una base de datos vacía para que el sistema funcione
-        printf("Creando base de datos vacía temporal...\n");
-        FILE *bin_file = fopen(bin_filename, "wb");
-        if (bin_file) {
-            HashEntry hash_table[HASH_SIZE];
-            for (int i = 0; i < HASH_SIZE; i++) {
-                hash_table[i].first_position = -1;
-            }
-            fwrite(hash_table, sizeof(HashEntry), HASH_SIZE, bin_file);
-            fclose(bin_file);
-            printf("Base de datos vacía creada. Use la opción 7 para cargar datos reales.\n");
-        }
-    } else {
-        fclose(test_file);
-        printf("Base de datos cargada: %s\n", bin_filename);
-    }
-    
-    // Crear pipe nombrado
-    if (mkfifo(PIPE_NAME, 0666) == -1) {
-        perror("Error creando pipe");
+        printf("ERROR: No se encuentra la base de datos '%s'\n", bin_filename);
+        printf("Ejecute primero el programa creador de la base de datos.\n");
+        sem_wait(sem_id);
+        shared_data->shutdown = 1;
+        sem_signal(sem_id);
         exit(1);
     }
+    fclose(test_file);
     
-    int fd = open(PIPE_NAME, O_RDWR);
-    if (fd == -1) {
-        perror("Error abriendo pipe");
-        unlink(PIPE_NAME);
-        exit(1);
-    }
-    
-    printf("Pipe creado. Esperando solicitudes de búsqueda...\n");
+    printf("Base de datos cargada: %s\n", bin_filename);
+    printf("Esperando solicitudes de búsqueda...\n");
     
     // Bucle principal del proceso de base de datos
     while (1) {
-        SearchRequest req;
-        SearchResponse resp;
+        // Verificar si hay solicitud sin bloquear
+        sem_wait(sem_id);
         
-        ssize_t bytes_read = read(fd, &req, sizeof(SearchRequest));
-        if (bytes_read == sizeof(SearchRequest)) {
-            memset(&resp, 0, sizeof(SearchResponse));
-            
-            // Procesar según el tipo de búsqueda
-            switch (req.search_type) {
-                case 1: // Nombre exacto
-                    resp.result_count = search_by_exact_name(bin_filename, req.search_term, resp.results, MAX_RESULTS);
-                    break;
-                case 2: // Palabra en nombre
-                    resp.result_count = search_by_name_word(bin_filename, req.search_term, resp.results, MAX_RESULTS);
-                    break;
-                case 3: // Artista
-                    resp.result_count = search_by_artist(bin_filename, req.search_term, resp.results, MAX_RESULTS);
-                    break;
-                case 4: // Año
-                    resp.result_count = search_by_year(bin_filename, req.search_year, resp.results, MAX_RESULTS);
-                    break;
-                case 5: // Rango bailabilidad
-                    resp.result_count = search_by_danceability_range(bin_filename, req.min_value, req.max_value, resp.results, MAX_RESULTS);
-                    break;
-                case 6: // Rango energía
-                    resp.result_count = search_by_energy_range(bin_filename, req.min_value, req.max_value, resp.results, MAX_RESULTS);
-                    break;
-                default:
-                    resp.result_count = 0;
-            }
-            
-            ssize_t bytes_written = write(fd, &resp, sizeof(SearchResponse));
-            if (bytes_written != sizeof(SearchResponse)) {
-                printf("Error enviando respuesta\n");
-            }
-        } else if (bytes_read == 0) {
-            break;
-        } else if (bytes_read == -1) {
-            perror("Error leyendo del pipe");
+        if (shared_data->shutdown) {
+            sem_signal(sem_id);
             break;
         }
+        
+        if (shared_data->request_ready) {
+            // Procesar solicitud
+            int search_type = shared_data->search_type;
+            char search_term[256];
+            int search_year = shared_data->search_year;
+            strcpy(search_term, shared_data->search_term);
+            
+            shared_data->request_ready = 0; // Solicitud en procesamiento
+            sem_signal(sem_id);
+            
+            // Realizar búsqueda (fuera del semáforo para no bloquear)
+            int result_count = 0;
+            switch (search_type) {
+                case 1: // Nombre exacto
+                    result_count = search_by_exact_name(bin_filename, search_term, 
+                                                       shared_data->results, MAX_RESULTS);
+                    break;
+                case 2: // Palabra en nombre
+                    result_count = search_by_name_word(bin_filename, search_term, 
+                                                      shared_data->results, MAX_RESULTS);
+                    break;
+                case 3: // Artista
+                    result_count = search_by_artist(bin_filename, search_term, 
+                                                   shared_data->results, MAX_RESULTS);
+                    break;
+                case 4: // Año
+                    result_count = search_by_year(bin_filename, search_year, 
+                                                 shared_data->results, MAX_RESULTS);
+                    break;
+                case 5: // Estadísticas
+                    {
+                        int total_songs, min_year, max_year;
+                        if (get_database_stats(bin_filename, &total_songs, &min_year, &max_year) == 0) {
+                            result_count = total_songs;
+                            shared_data->results[0].year = min_year;
+                            shared_data->results[0].duration_ms = max_year;
+                        }
+                    }
+                    break;
+            }
+            
+            // Guardar resultados
+            sem_wait(sem_id);
+            shared_data->result_count = result_count;
+            shared_data->response_ready = 1; // Respuesta lista
+            sem_signal(sem_id);
+            
+        } else {
+            sem_signal(sem_id);
+            usleep(1000); // Espera mínima cuando no hay trabajo
+        }
     }
-    
-    close(fd);
-    unlink(PIPE_NAME);
 }
 
-int main(int argc, char *argv[]) {
+int main() {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     
-    if (argc == 2 && strcmp(argv[1], "--db") == 0) {
-        database_process();
-        return 0;
+    // Crear memoria compartida
+    shm_id = shmget(SHM_KEY, sizeof(SharedData), IPC_CREAT | 0666);
+    if (shm_id == -1) {
+        perror("Error creando memoria compartida");
+        return 1;
     }
     
-    // Si se pasa --create, crear la base de datos y salir
-    if (argc == 2 && strcmp(argv[1], "--create") == 0) {
-        create_database_from_csv();
-        return 0;
+    // Adjuntar memoria compartida
+    shared_data = (SharedData*)shmat(shm_id, NULL, 0);
+    if (shared_data == (void*)-1) {
+        perror("Error adjuntando memoria compartida");
+        return 1;
     }
     
+    // Inicializar memoria compartida
+    memset(shared_data, 0, sizeof(SharedData));
+    shared_data->request_ready = 0;
+    shared_data->response_ready = 0;
+    shared_data->shutdown = 0;
+    
+    // Crear semáforo
+    sem_id = semget(SEM_KEY, 1, IPC_CREAT | 0666);
+    if (sem_id == -1) {
+        perror("Error creando semáforo");
+        cleanup();
+        return 1;
+    }
+    
+    // Inicializar semáforo a 1
+    if (semctl(sem_id, 0, SETVAL, 1) == -1) {
+        perror("Error inicializando semáforo");
+        cleanup();
+        return 1;
+    }
+    
+    // Crear proceso de base de datos
     db_pid = fork();
     if (db_pid == 0) {
+        // Proceso hijo - base de datos
         database_process();
         exit(0);
     } else if (db_pid > 0) {
+        // Proceso padre - interfaz de usuario
         printf("Iniciando interfaz de usuario...\n");
+        sleep(1); // Esperar a que la BD se inicialice
         
-        if (wait_for_pipe(PIPE_NAME, 5) == -1) {
-            printf("Error: No se pudo conectar con la base de datos\n");
-            cleanup();
-            return 1;
-        }
-        
-        pipe_fd = open(PIPE_NAME, O_RDWR);
-        if (pipe_fd == -1) {
-            perror("Error conectando al pipe");
-            cleanup();
-            return 1;
-        }
-        
-        printf("Conectado a la base de datos (PID: %d)\n", db_pid);
-        printf("Sistema listo para búsquedas.\n");
         user_interface_process();
         
         cleanup();
     } else {
         perror("Error creando proceso");
+        cleanup();
         return 1;
     }
     

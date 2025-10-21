@@ -1,18 +1,13 @@
 CC = gcc
-CFLAGS = -O2 -Wall -Wextra -std=c99 -D_DEFAULT_SOURCE -D_BSD_SOURCE
+CFLAGS = -O2 -Wall -Wextra -std=c99 -D_DEFAULT_SOURCE
 TARGET = p1-dataProgram
-SOURCES = p1-dataProgram.c database.c
-HEADERS = database.h
+SOURCES = p1-dataProgram.c
 
-$(TARGET): $(SOURCES) $(HEADERS)
+$(TARGET): $(SOURCES)
 	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCES)
 
 clean:
-	rm -f $(TARGET) songs_database.bin
-	rm -f /tmp/music_db_pipe
+	rm -f $(TARGET)
+	-ipcrm -a 2>/dev/null || true
 
-# Crear base de datos directamente desde línea de comandos
-create-db: $(TARGET)
-	./$(TARGET) --create
-
-.PHONY: clean create-db
+.PHONY: clean
